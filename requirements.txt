@@ -1,0 +1,6 @@
+ebooklib
+beautifulsoup4
+lxml
+requests
+spacy
+tiktoken
