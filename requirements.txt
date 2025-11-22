@@ -5,3 +5,5 @@ requests
 spacy
 tiktoken
 phunspell
+python-dotenv
+openai

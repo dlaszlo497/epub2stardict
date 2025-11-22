@@ -5,8 +5,8 @@ from typing import List
 
 import phunspell  # pip install phunspell
 
-INPUT_PATH = "data/500_word_senses.jsonl"
-OUTPUT_PATH = "data/550_word_senses_bad.jsonl"  # csak a hibás sorok mennek ide
+INPUT_PATH = "data/500_word_senses_openai.jsonl"
+OUTPUT_PATH = "data/550_word_senses_openai_bad.jsonl"  # csak a hibás sorok mennek ide
 
 # magyar + angol betűk – minimális formai szűréshez
 HU_WORD_RE = re.compile(r"^[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+$")

@@ -1,15 +1,21 @@
 import json
 import os
 import re
-import requests
 import random
 import time
+from typing import Tuple
+
 import tiktoken
+from dotenv import load_dotenv
+from openai import OpenAI, APIStatusError
+
+# .env betöltése (OPENAI_API_KEY innen is jöhet)
+load_dotenv()
 
 # Bemeneti / kimeneti fájlok
 CHUNKS_PATH = "data/200_chunks.jsonl"       # id + sentence
 WORDS_PATH = "data/400_word_pos.jsonl"      # word, lemma, pos (STRING), contexts[]
-OUTPUT_PATH = "data/500_word_senses.jsonl"  # 1 sor / szó (lemma+POS szinten)
+OUTPUT_PATH = "data/500_word_senses_openai.jsonl"  # 1 sor / szó (lemma+POS szinten)
 
 # Max ennyi példamondatot adunk át kontextusnak egy szóhoz
 MAX_EXAMPLES_PER_WORD = 5
@@ -21,9 +27,15 @@ BOOK_INFO = (
     "set on a farm run by animals."
 )
 
-# Ollama beállítások
-OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
-MODEL_NAME_GLOSS = "gemma3:27b"
+# OpenAI beállítások
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # .env-ből vagy env-ből jön
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY nincs beállítva (.env vagy env).")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Modell név (reasoning mini alias)
+MODEL_NAME_GLOSS = "gpt-5-mini"
 
 # POS angol magyarázat a prompthoz (csak azokat, amiket tényleg használunk)
 POS_DESC_EN = {
@@ -134,41 +146,70 @@ def is_bad_gloss(gloss: str) -> bool:
     return False
 
 
-def call_ollama(model: str, prompt: str, temperature: float = 0.1) -> tuple[str, int, int]:
+def call_openai(
+        model: str,
+        prompt: str,
+        max_output_tokens: int = 50,
+) -> Tuple[str, int, int]:
     """
-    LLM-hívás Ollamához.
-    Visszatér:
+    LLM-hívás OpenAI Responses API-val (gpt-5 / gpt-5-mini).
+
+    - max_output_tokens alapból 50 (rövid, 3 soros outputhoz elég).
+    - reasoning.effort = "minimal", hogy ne égjen el minden reasoningre.
+
+    Visszaad:
       - content (string)
-      - estimated_input_tokens
-      - estimated_output_tokens
-    A globális TOTAL_INPUT_TOKENS / TOTAL_OUTPUT_TOKENS értékét is növeli.
+      - input_tokens
+      - output_tokens
+
+    Ha HTTP hiba van (pl. 400), kiírja a teljes response-t.
     """
+
     global TOTAL_INPUT_TOKENS, TOTAL_OUTPUT_TOKENS
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": temperature,
-    }
+    # input token becslés fallbacknek
+    input_tokens_est = estimate_tokens(prompt)
 
-    # input token becslés (prompt)
-    input_tokens = estimate_tokens(prompt)
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=prompt,
+            max_output_tokens=max_output_tokens,
+            reasoning={"effort": "minimal"},
+            text={"verbosity": "low"}  # ne magyarázzon hosszan
+        )
+    except APIStatusError as e:
+        print("OpenAI API error status code:", e.status_code)
+        try:
+            print("OpenAI API raw response:")
+            print(e.response)
+        except Exception:
+            print("OpenAI API response could not be printed safely.")
+        raise
 
-    resp = requests.post(
-        OLLAMA_URL,
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(payload),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"]["content"]
+    # Egyszerű szövegkimenet (összefűzi az összes text chunkot)
+    content = getattr(resp, "output_text", None) or ""
+    if not content.strip():
+        print("WARNING: model returned empty content.")
+        try:
+            print("status:", resp.status)
+            print("incomplete_details:", resp.incomplete_details)
+            print("usage:", resp.usage)
+            print("full response object:")
+            print(resp)
+        except Exception:
+            print("Could not pretty-print response object.")
+        raise ValueError("empty response from model")
 
-    # output token becslés
-    output_tokens = estimate_tokens(content)
+    # usage
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        input_tokens = getattr(usage, "input_tokens", input_tokens_est)
+        output_tokens = getattr(usage, "output_tokens", estimate_tokens(content))
+    else:
+        input_tokens = input_tokens_est
+        output_tokens = estimate_tokens(content)
 
-    # globális számlálók frissítése
     TOTAL_INPUT_TOKENS += input_tokens
     TOTAL_OUTPUT_TOKENS += output_tokens
 
@@ -221,14 +262,14 @@ def generate_hungarian_gloss_for_lemma(
           * example_lemma_en: a lemma alakot használva
 
     Plusz:
-      - input / output token becslés az adott hívásra.
+      - input / output token szám az adott hívásra (API usage alapján, ha van).
     """
     if pos:
         pos_desc = POS_DESC_EN.get(pos, "a part of speech")
-        pos_info_line = f"{pos} - {pos_desc}"
+        pos_desc_line = f"{pos} - {pos_desc}"
         pos_tag_for_output = pos
     else:
-        pos_info_line = "unknown (the model must infer it from the examples)"
+        pos_desc_line = "unknown (the model must infer it from the examples)"
         pos_tag_for_output = "unknown"
 
     examples_block = ""
@@ -251,6 +292,15 @@ YOUR JOB:
 1) Use the GIVEN POS exactly as provided. Do not guess or select another POS.
 2) Infer the GENERAL DICTIONARY MEANING of the word with this POS.
 3) Choose ONE common Hungarian word OR SHORT EXPRESSION (1-3 words) that best matches that meaning and POS.
+   IMPORTANT: the Hungarian expression must be a clean dictionary headword or short phrase ONLY.
+   It must NOT contain:
+     - parentheses,
+     - question marks,
+     - explanations,
+     - multiple alternatives.
+   Example:
+     WRONG: "ágynemű (oromáglya?)"
+     CORRECT: "ágynemű"
 4) Create TWO TOTALLY DIFFERENT SHORT ENGLISH EXAMPLE SENTENCES (not from the book) that clearly show this meaning:
    - The first must use the original surface form exactly as given.
    - The second must use the lemma form.
@@ -258,11 +308,11 @@ YOUR JOB:
 
 Details:
 - Focus on the BASE WORD (lemma), not on the specific inflected forms, when deciding meaning.
-- The POS tag for this word in the book is: {pos}
-- Description of this POS tag: {pos_info_line}
+- The POS tag for this word in the book is: {pos_tag_for_output}
+- Description of this POS tag: {pos_desc_line}
 - Do NOT reuse or quote the example sentences.
-- The Hungarian expression can be multi-word if that is the most natural dictionary equivalent (e.g. "szerzői jog").
-- If you are uncertain, guess the most likely general dictionary meaning.
+- The Hungarian expression can be multi-word if that is the most natural dictionary equivalent (e.g. "szerzői jog"), but it must still be clean, without parentheses or explanations.
+- If you are uncertain, choose the single most likely general dictionary meaning.
 - NEVER answer with "Sajnálom", "Nem tudom", "I am sorry", "Sorry" or any similar meta-reply.
 
 Word (lemma): {lemma}
@@ -272,19 +322,23 @@ Example sentences from the book:
 {examples_block}
 
 VERY IMPORTANT OUTPUT FORMAT (EXACTLY THREE LINES, NO BULLETS, NO EXTRA TEXT):
-Line 1: HU=<ONE_HUNGARIAN_WORD_OR_SHORT_EXPRESSION>
+Line 1: HU=<ONE_CLEAN_HUNGARIAN_WORD_OR_SHORT_EXPRESSION_WITHOUT_PARENTHESES_OR_EXPLANATIONS>
 Line 2: <one short English sentence containing the surface form '{word}'>
 Line 3: <one short English sentence containing the lemma '{lemma}'>
 
-<ONE_HUNGARIAN_WORD_OR_SHORT_EXPRESSION> can be ONE or SEVERAL (1-3) Hungarian words.
+<ONE_CLEAN_HUNGARIAN_WORD_OR_SHORT_EXPRESSION_WITHOUT_PARENTHESES_OR_EXPLANATIONS> can be ONE or SEVERAL (1-3) Hungarian words.
 """
 
-    raw, input_tokens, output_tokens = call_ollama(MODEL_NAME_GLOSS, prompt, temperature=0.1)
+    raw, input_tokens, output_tokens = call_openai(
+        MODEL_NAME_GLOSS,
+        prompt,
+        max_output_tokens=50,
+    )
 
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
 
     if not lines:
-        raise ValueError("empty response from model")
+        raise ValueError("empty response from model (raw content was empty)")
 
     first_line = lines[0]
     second_line = lines[1] if len(lines) > 1 else ""
@@ -315,7 +369,9 @@ def format_eta(seconds: int) -> str:
 
 
 def main():
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    out_dir = os.path.dirname(OUTPUT_PATH)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     print("Loading chunks (sentences)...")
     chunks = load_chunks()
@@ -416,7 +472,6 @@ def main():
 
     total_elapsed = time.time() - start_time
     print(f"Done, written {written} entries to {OUTPUT_PATH}")
-    print(f"Total elapsed time: {format_eta(int(total_elapsed))}")
     print(f"Estimated total input tokens:  {TOTAL_INPUT_TOKENS}")
     print(f"Estimated total output tokens: {TOTAL_OUTPUT_TOKENS}")
     print(f"Estimated total tokens (in+out): {TOTAL_INPUT_TOKENS + TOTAL_OUTPUT_TOKENS}")

@@ -12,7 +12,7 @@ OUTPUT_PATH = "data/400_word_pos.jsonl"
 # csak kisbetűs angol betűk
 WORD_OK_RE = re.compile(r"^[a-z]+$")
 
-# Kiszűrendő POS-ok: főnév, szimbólum, írásjel, egyéb szófaj, szóköz
+# Kiszűrendő POS-ok: tulajdonnév, szimbólum, írásjel, egyéb szófaj, szóköz
 BAD_POS = {"PROPN", "SYM", "PUNCT", "X", "SPACE"}
 
 # spaCy modell
@@ -22,7 +22,7 @@ NLP = spacy.load("en_core_web_sm")
 def accept_word_form(word: str) -> bool:
     """
     Elfogadjuk szónak, ha:
-      - csak betűkből áll
+      - csak [a-z] betűkből áll
       - legalább 3 karakter hosszú
     Semmi stopword, semmi extra okoskodás.
     """
@@ -57,12 +57,12 @@ def collect_lemma_and_pos_from_contexts(word: str, contexts, chunks, nlp_cache):
     """
     Végigmegy a szó összes context chunkján, és összegyűjti:
       - az összes (lemma, POS) párt (lemma_pos_set),
-      - POS -> azok a context ID-k, ahol így fordult elő (pos_to_contexts).
+      - (lemma, POS) -> azok a context ID-k, ahol így fordult elő (lemma_pos_to_contexts).
 
     Nincs fallback, csak tényleges előfordulás számít.
     """
     lemma_pos_set = set()
-    pos_to_contexts = defaultdict(set)
+    lemma_pos_to_contexts = defaultdict(set)
 
     for cid in contexts:
         sentence = chunks.get(cid)
@@ -83,9 +83,9 @@ def collect_lemma_and_pos_from_contexts(word: str, contexts, chunks, nlp_cache):
                 lemma = token.lemma_.lower()
                 pos = token.pos_
                 lemma_pos_set.add((lemma, pos))
-                pos_to_contexts[pos].add(cid)
+                lemma_pos_to_contexts[(lemma, pos)].add(cid)
 
-    return lemma_pos_set, pos_to_contexts
+    return lemma_pos_set, lemma_pos_to_contexts
 
 
 def main():
@@ -115,22 +115,24 @@ def main():
                 continue
 
             # 2) lemmák + POS-ok gyűjtése MINDEN context-ből
-            lemma_pos_set, pos_to_contexts = collect_lemma_and_pos_from_contexts(
+            lemma_pos_set, lemma_pos_to_contexts = collect_lemma_and_pos_from_contexts(
                 word, contexts, chunks, nlp_cache
             )
 
-            # invariáns: ha a 300_word_contexts szerint itt szerepel a szó,
-            # akkor normál esetben legalább egy token-matchnek lennie kell
-            assert lemma_pos_set, f"Nincs előfordulás a szóra: {word}, contexts={contexts}"
+            # ha valamiért mégsem találtuk meg a szó előfordulását
+            if not lemma_pos_set:
+                print(f"[WARN] Nincs előfordulás a szóra: {word}, contexts={contexts}")
+                skipped_all_propn_or_empty += 1
+                continue
 
-            # POS-ok szűrése
-            lemma_pos_set = {
-                (lemma, pos)
-                for (lemma, pos) in lemma_pos_set
+            # (lemma, pos) -> contexts szűrése BAD_POS alapján
+            lemma_pos_to_contexts = {
+                (lemma, pos): ctx_ids
+                for (lemma, pos), ctx_ids in lemma_pos_to_contexts.items()
                 if pos not in BAD_POS
             }
-            for bad in BAD_POS:
-                pos_to_contexts.pop(bad, None)
+
+            lemma_pos_set = set(lemma_pos_to_contexts.keys())
 
             # ha csak ilyen “rossz” POS-ként létezett, akkor nem kell a kimenetbe
             if not lemma_pos_set:
@@ -139,7 +141,7 @@ def main():
 
             # 3) egy sor MINDEN (lemma, POS) kombinációra
             for (lemma, pos) in sorted(lemma_pos_set):
-                ctx_ids = pos_to_contexts.get(pos, set())
+                ctx_ids = lemma_pos_to_contexts.get((lemma, pos), set())
                 ctx_list = sorted(ctx_ids)
 
                 out_rec = {
