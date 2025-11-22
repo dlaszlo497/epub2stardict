@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from collections import defaultdict
 
 import spacy
 
@@ -8,36 +9,26 @@ WORD_CONTEXTS_PATH = "data/300_word_contexts.jsonl"
 CHUNKS_PATH = "data/200_chunks.jsonl"
 OUTPUT_PATH = "data/400_word_pos.jsonl"
 
-# egyszerű angol stopword lista – bővíthető
-STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "else",
-    "for", "of", "in", "on", "at", "to", "from", "by", "with",
-    "is", "am", "are", "was", "were", "be", "been", "being",
-    "he", "she", "it", "they", "we", "you", "i",
-    "this", "that", "these", "those",
-    "as", "so", "not", "no", "yes",
-    "do", "does", "did", "done",
-    "have", "has", "had",
-    "his", "her", "their", "our", "your", "my",
-    # római számok 1–20 (lower-case, a 300-as script már lower-case-el)
-    "i", "ii", "iii", "iv", "v",
-    "vi", "vii", "viii", "ix", "x",
-    "xi", "xii", "xiii", "xiv", "xv",
-    "xvi", "xvii", "xviii", "xix", "xx",
-}
+# csak kisbetűs angol betűk
+WORD_OK_RE = re.compile(r"^[a-z]+$")
 
-# “normál” szavak: csak betű, min. 3 karakter
-WORD_OK_RE = re.compile(r"^[a-z]{3,}$")
+# Kiszűrendő POS-ok: főnév, szimbólum, írásjel, egyéb szófaj, szóköz
+BAD_POS = {"PROPN", "SYM", "PUNCT", "X", "SPACE"}
 
 # spaCy modell
 NLP = spacy.load("en_core_web_sm")
 
 
 def accept_word_form(word: str) -> bool:
-    """Alak alapú szűrés: regex + stopwords."""
-    if not WORD_OK_RE.match(word):
+    """
+    Elfogadjuk szónak, ha:
+      - csak betűkből áll
+      - legalább 3 karakter hosszú
+    Semmi stopword, semmi extra okoskodás.
+    """
+    if len(word) < 3:
         return False
-    if word in STOPWORDS:
+    if not WORD_OK_RE.match(word):
         return False
     return True
 
@@ -53,15 +44,25 @@ def load_chunks():
     return chunks
 
 
+def normalize_for_match(text: str) -> str:
+    """
+    Ugyanaz az elv, mint a 300_word_contexts-ben:
+    csak [A-Za-z] betűk maradnak, lower-case.
+    Pl. 'Mrs.' -> 'mrs'
+    """
+    return re.sub(r"[^A-Za-z]", "", text).lower()
+
+
 def collect_lemma_and_pos_from_contexts(word: str, contexts, chunks, nlp_cache):
     """
-    Végigmegy a szó összes context chunkján, minden érintett mondatot
-    spaCy-vel POS-oz, és összegyűjti:
-      - lemmák halmazát
-      - POS tagek halmazát (PROPN-t később kiszűrjük)
+    Végigmegy a szó összes context chunkján, és összegyűjti:
+      - az összes (lemma, POS) párt (lemma_pos_set),
+      - POS -> azok a context ID-k, ahol így fordult elő (pos_to_contexts).
+
+    Nincs fallback, csak tényleges előfordulás számít.
     """
-    lemmas = set()
-    poses = set()
+    lemma_pos_set = set()
+    pos_to_contexts = defaultdict(set)
 
     for cid in contexts:
         sentence = chunks.get(cid)
@@ -75,18 +76,16 @@ def collect_lemma_and_pos_from_contexts(word: str, contexts, chunks, nlp_cache):
             nlp_cache[cid] = doc
 
         for token in doc:
-            if token.text.lower() == word:
+            norm = normalize_for_match(token.text)
+            if not norm:
+                continue
+            if norm == word:
                 lemma = token.lemma_.lower()
                 pos = token.pos_
+                lemma_pos_set.add((lemma, pos))
+                pos_to_contexts[pos].add(cid)
 
-                # egyszerű heur: -ness → főnév
-                if pos == "ADJ" and lemma.endswith("ness"):
-                    pos = "NOUN"
-
-                lemmas.add(lemma)
-                poses.add(pos)
-
-    return lemmas, poses
+    return lemma_pos_set, pos_to_contexts
 
 
 def main():
@@ -94,8 +93,8 @@ def main():
 
     chunks = load_chunks()
 
-    total = 0
-    kept = 0
+    total_words = 0
+    written_records = 0
     skipped_form = 0
     skipped_all_propn_or_empty = 0
 
@@ -105,61 +104,57 @@ def main():
             open(OUTPUT_PATH, "w", encoding="utf-8") as f_out:
 
         for line in f_in:
-            total += 1
+            total_words += 1
             rec = json.loads(line)
-            word = rec["word"]  # lower-case
+            word = rec["word"]      # lower-case
             contexts = rec["contexts"]
 
-            # 1) alak alapú szűrés (regex + stopwords)
+            # 1) alak alapú szűrés (regex + hossz)
             if not accept_word_form(word):
                 skipped_form += 1
                 continue
 
             # 2) lemmák + POS-ok gyűjtése MINDEN context-ből
-            lemma_set, pos_set = collect_lemma_and_pos_from_contexts(
+            lemma_pos_set, pos_to_contexts = collect_lemma_and_pos_from_contexts(
                 word, contexts, chunks, nlp_cache
             )
 
-            # fallback: ha semmit nem találtunk
-            if not lemma_set and not pos_set:
-                doc = NLP(word)
-                if doc:
-                    token = doc[0]
-                    lemma = token.lemma_.lower()
-                    pos = token.pos_
-                    if pos == "ADJ" and lemma.endswith("ness"):
-                        pos = "NOUN"
-                    lemma_set.add(lemma)
-                    pos_set.add(pos)
+            # invariáns: ha a 300_word_contexts szerint itt szerepel a szó,
+            # akkor normál esetben legalább egy token-matchnek lennie kell
+            assert lemma_pos_set, f"Nincs előfordulás a szóra: {word}, contexts={contexts}"
 
-            # PROPN-eket töröljük
-            if "PROPN" in pos_set:
-                pos_set.discard("PROPN")
+            # POS-ok szűrése
+            lemma_pos_set = {
+                (lemma, pos)
+                for (lemma, pos) in lemma_pos_set
+                if pos not in BAD_POS
+            }
+            for bad in BAD_POS:
+                pos_to_contexts.pop(bad, None)
 
-            if not pos_set:
+            # ha csak ilyen “rossz” POS-ként létezett, akkor nem kell a kimenetbe
+            if not lemma_pos_set:
                 skipped_all_propn_or_empty += 1
                 continue
 
-            # lemma: ha több van, választunk egyet
-            if lemma_set:
-                lemma = sorted(lemma_set)[0]
-            else:
-                lemma = word
+            # 3) egy sor MINDEN (lemma, POS) kombinációra
+            for (lemma, pos) in sorted(lemma_pos_set):
+                ctx_ids = pos_to_contexts.get(pos, set())
+                ctx_list = sorted(ctx_ids)
 
-            pos_list = sorted(pos_set)
+                out_rec = {
+                    "word": word,
+                    "lemma": lemma,
+                    "pos": pos,
+                    "contexts": ctx_list,
+                }
 
-            out_rec = {
-                "word": word,
-                "lemma": lemma,
-                "pos": pos_list,  # pl. ["NOUN", "VERB"]
-                "contexts": contexts,  # a végén
-            }
-
-            f_out.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
-            kept += 1
+                f_out.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
+                written_records += 1
 
     print(
-        f"Total: {total}, kept: {kept}, "
+        f"Total words: {total_words}, "
+        f"records written: {written_records}, "
         f"skipped_form: {skipped_form}, "
         f"skipped_all_propn_or_empty: {skipped_all_propn_or_empty} → {OUTPUT_PATH}"
     )

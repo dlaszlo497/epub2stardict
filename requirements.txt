@@ -4,3 +4,4 @@ lxml
 requests
 spacy
 tiktoken
+phunspell

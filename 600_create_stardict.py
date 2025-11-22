@@ -19,16 +19,10 @@ ENCODING = "UTF-8"
 LANG = "en-hu"
 
 
-def build_definition(entry: dict) -> str:
-    """
-    A <k> tag UTÁNI rész, pl.:
+def build_definition(entry: dict, seen_examples_for_word: set[str]) -> str:
 
-    fejezet (főnév)
-    The first chapter...
-    Each chapter...
-    """
     meaning_hu = (entry.get("meaning_hu") or "").strip()
-    pos_ai_hu = (entry.get("pos_ai_hu") or "").strip()  # pl. "főnév", "ige"
+    pos_ai_hu = (entry.get("pos_hu") or "").strip()
     example_surface_en = (entry.get("example_surface_en") or "").strip()
     example_lemma_en = (entry.get("example_lemma_en") or "").strip()
 
@@ -48,11 +42,14 @@ def build_definition(entry: dict) -> str:
             else:
                 lines.append(word)
 
-    # példamondatok
-    if example_surface_en:
+    # példamondatok – szónként deduplikálva
+    if example_surface_en and example_surface_en not in seen_examples_for_word:
         lines.append(example_surface_en)
-    if example_lemma_en:
+        seen_examples_for_word.add(example_surface_en)
+
+    if example_lemma_en and example_lemma_en not in seen_examples_for_word:
         lines.append(example_lemma_en)
+        seen_examples_for_word.add(example_lemma_en)
 
     # fallback, ha minden üres
     if not lines:
@@ -63,14 +60,8 @@ def build_definition(entry: dict) -> str:
 
 
 def load_entries(jsonl_path: Path):
-    """
-    JSONL -> (word, definition) párok.
-
-    - ok == false sorok kimaradnak
-    - ugyanaz a word csak egyszer kerül be (első előfordulás)
-    - UTF-8 bájtsorrend szerint rendezve (mint a működő .idx-ben)
-    """
-    entries_map: dict[str, str] = {}
+    word_to_def_blocks: dict[str, list[str]] = {}
+    word_to_seen_examples: dict[str, set[str]] = {}
 
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -88,16 +79,19 @@ def load_entries(jsonl_path: Path):
             if not word:
                 continue
 
-            definition = build_definition(obj)
+            seen_examples = word_to_seen_examples.setdefault(word, set())
+            definition_block = build_definition(obj, seen_examples)
 
-            # csak az első előfordulást tartjuk meg
-            if word not in entries_map:
-                entries_map[word] = definition
+            if definition_block:
+                word_to_def_blocks.setdefault(word, []).append(definition_block)
 
-    entries = sorted(
-        entries_map.items(),
-        key=lambda kv: kv[0].encode("utf-8")
-    )
+    # egy angol szón belül a szófaji blokkokat üres sorral választjuk el egymástól
+    entries = []
+    for word in sorted(word_to_def_blocks.keys(), key=lambda w: w.encode("utf-8")):
+        blocks = word_to_def_blocks[word]
+        full_definition = "\n\n".join(blocks)
+        entries.append((word, full_definition))
+
     return entries
 
 
@@ -167,7 +161,7 @@ def main():
 
     print(f"Beolvasás: {INPUT_JSONL}")
     entries = load_entries(INPUT_JSONL)
-    print(f"Szócikkek száma (ok != false, deduplikált címszavak): {len(entries)}")
+    print(f"Szócikkek száma (ok != false, címszavak): {len(entries)}")
 
     print("dict / idx építése...")
     dict_data, idx_data = build_dict_and_idx(entries)
